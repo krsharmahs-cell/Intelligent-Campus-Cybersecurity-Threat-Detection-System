@@ -1,0 +1,233 @@
+# %% [markdown]
+# # Robustness tests on CIC-IDS2017
+# Final model: Random Forest (100 trees), no class weights, no resampling,
+# correlation-filtered features (filter recomputed on each training set).
+#
+# Test A: seed stability     (5 different random splits)
+# Test B: feature noise      (multiplicative jitter on the test features)
+# Test C: leave-one-day-out  (unseen attack types and unseen-day benign traffic)
+
+# %% Imports and settings
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, f1_score
+from sklearn.model_selection import train_test_split
+
+OUT_DIR = Path("outputs")
+RANDOM_STATE = 42
+SEEDS = [42, 1, 2, 3, 4]          # must include RANDOM_STATE
+TEST_SIZE = 0.30
+MAX_TRAIN_PER_CLASS = 50_000
+CORR_THRESHOLD = 0.95
+STAT_SAMPLE = 100_000
+N_TREES = 100
+NOISE_LEVELS = [0.0, 0.05, 0.10, 0.20, 0.50]   # relative jitter (0.10 = 10%)
+
+# %% Load data (float32 to save memory)
+df = pd.read_parquet(OUT_DIR / "cicids2017_clean.parquet")
+meta_cols = ["Label", "source_file", "is_attack"]
+features = [c for c in df.columns if c not in meta_cols and df[c].nunique() > 1]
+
+X = df[features].astype("float32")
+y = df["Label"]
+src = df["source_file"]
+del df
+print("Data:", X.shape, "| features:", len(features))
+print("Files:", sorted(src.unique()))
+
+
+# %% Helpers
+def cap_ids(y_part, cap, seed):
+    """Index labels of a training set capped at `cap` rows per class."""
+    rng = np.random.RandomState(seed)
+    keep = []
+    for _, grp in y_part.groupby(y_part):
+        ids = grp.index.values
+        if len(ids) > cap:
+            ids = rng.choice(ids, cap, replace=False)
+        keep.append(ids)
+    return np.concatenate(keep)
+
+
+def correlation_filter(X_part, seed):
+    sample = X_part.sample(min(STAT_SAMPLE, len(X_part)), random_state=seed)
+    corr = sample.corr(method="spearman").abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    drop = [c for c in upper.columns if (upper[c] > CORR_THRESHOLD).any()]
+    return [c for c in X_part.columns if c not in drop]
+
+
+def fit_rf(X_part, y_part, seed):
+    return RandomForestClassifier(
+        n_estimators=N_TREES, n_jobs=-1, random_state=seed
+    ).fit(X_part, y_part)
+
+
+def alarm_rates(y_true, pred):
+    """False-alarm rate on benign flows, detection rate on attack flows."""
+    y_true = np.asarray(y_true)
+    pred = np.asarray(pred)
+    benign = y_true == "BENIGN"
+    fa = float(np.mean(pred[benign] != "BENIGN")) if benign.any() else np.nan
+    det = float(np.mean(pred[~benign] != "BENIGN")) if (~benign).any() else np.nan
+    return fa, det
+
+
+# %% Test A: seed stability
+seed_rows = []
+seed_f1 = {}
+reference = None
+
+for seed in SEEDS:
+    t0 = time.time()
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=TEST_SIZE, stratify=y, random_state=seed
+    )
+    ids = cap_ids(y_tr, MAX_TRAIN_PER_CLASS, seed)
+    X_tr, y_tr = X_tr.loc[ids], y_tr.loc[ids]
+
+    feats = correlation_filter(X_tr, seed)
+    model = fit_rf(X_tr[feats], y_tr, seed)
+    pred = model.predict(X_te[feats])
+
+    rep = classification_report(y_te, pred, output_dict=True, zero_division=0)
+    seed_f1[f"seed_{seed}"] = {c: rep[c]["f1-score"] for c in model.classes_}
+    fa, det = alarm_rates(y_te, pred)
+    seed_rows.append({
+        "seed": seed,
+        "n_features": len(feats),
+        "macro_f1": f1_score(y_te, pred, average="macro", zero_division=0),
+        "weighted_f1": f1_score(y_te, pred, average="weighted", zero_division=0),
+        "false_alarm_rate": fa,
+        "attack_detection": det,
+    })
+    print(f"seed {seed}: macro-F1 {seed_rows[-1]['macro_f1']:.4f} "
+          f"({len(feats)} features, {time.time() - t0:.0f}s)")
+
+    if seed == RANDOM_STATE:
+        reference = (model, feats, X_te, y_te, pred)
+
+seed_df = pd.DataFrame(seed_rows).set_index("seed")
+print("\nSEED STABILITY")
+print(seed_df.round(4))
+print("\nMean:\n", seed_df.mean().round(4))
+print("Std:\n", seed_df.std().round(4))
+seed_df.to_csv(OUT_DIR / "robustness_seeds_summary.csv")
+
+per_class = pd.DataFrame(seed_f1)
+per_class["mean"] = per_class.mean(axis=1)
+per_class["std"] = per_class.drop(columns="mean").std(axis=1)
+per_class = per_class.round(3)
+print("\nPER-CLASS F1 ACROSS SEEDS (large std = unreliable class)")
+print(per_class[["mean", "std"]])
+per_class.to_csv(OUT_DIR / "robustness_seeds_per_class.csv")
+
+# %% Test B: feature noise
+model, feats, X_te, y_te, _ = reference
+base = X_te[feats].to_numpy(dtype="float64")
+rng = np.random.RandomState(RANDOM_STATE)
+
+noise_rows = []
+for level in NOISE_LEVELS:
+    if level == 0:
+        noisy = base
+    else:
+        noisy = base * (1.0 + rng.normal(0.0, level, size=base.shape))
+    pred = model.predict(pd.DataFrame(noisy.astype("float32"), columns=feats))
+    fa, det = alarm_rates(y_te, pred)
+    noise_rows.append({
+        "noise_level": level,
+        "macro_f1": f1_score(y_te, pred, average="macro", zero_division=0),
+        "weighted_f1": f1_score(y_te, pred, average="weighted", zero_division=0),
+        "false_alarm_rate": fa,
+        "attack_detection": det,
+    })
+    print(f"noise {level:>4.0%}: macro-F1 {noise_rows[-1]['macro_f1']:.4f}, "
+          f"false alarms {fa:.4f}, attacks detected {det:.4f}")
+
+noise_df = pd.DataFrame(noise_rows).set_index("noise_level").round(4)
+print("\nNOISE ROBUSTNESS")
+print(noise_df)
+noise_df.to_csv(OUT_DIR / "robustness_noise.csv")
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(noise_df.index * 100, noise_df["macro_f1"], marker="o", label="macro-F1")
+ax.plot(noise_df.index * 100, noise_df["attack_detection"], marker="s",
+        label="attack detection rate")
+ax.plot(noise_df.index * 100, 1 - noise_df["false_alarm_rate"], marker="^",
+        label="benign recall (1 - false alarm rate)")
+ax.set_xlabel("Noise level (% relative jitter on each feature)")
+ax.set_ylabel("Score")
+ax.set_ylim(0, 1.05)
+ax.set_title("Robustness to feature noise")
+ax.grid(alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig(OUT_DIR / "robustness_noise.png", dpi=150)
+plt.close()
+
+# %% Test C: leave-one-day-out (unseen attacks, unseen-day benign traffic)
+lodo_rows = []
+for f in sorted(src.unique()):
+    t0 = time.time()
+    test_mask = (src == f).to_numpy()
+    y_train_all = y[~test_mask]
+
+    ids = cap_ids(y_train_all, MAX_TRAIN_PER_CLASS, RANDOM_STATE)
+    X_tr, y_tr = X.loc[ids], y.loc[ids]
+    feats_f = correlation_filter(X_tr, RANDOM_STATE)
+    model_f = fit_rf(X_tr[feats_f], y_tr, RANDOM_STATE)
+
+    X_held, y_held = X.loc[test_mask], y.loc[test_mask]
+    pred = model_f.predict(X_held[feats_f])
+    fa, det = alarm_rates(y_held, pred)
+
+    attack_mask = (y_held != "BENIGN").to_numpy()
+    mostly = (
+        pd.Series(pred[attack_mask]).value_counts().index[0]
+        if attack_mask.any() else ""
+    )
+    lodo_rows.append({
+        "held_out_file": f,
+        "n_flows": len(y_held),
+        "n_benign": int((~attack_mask).sum()),
+        "n_attack": int(attack_mask.sum()),
+        "attack_types": ", ".join(sorted(y_held[attack_mask].unique())),
+        "false_alarm_rate": fa,
+        "attack_detection": det,
+        "attacks_mostly_labelled_as": mostly,
+    })
+    print(f"{f}: false alarms {fa:.4f}, detection {det:.4f} ({time.time() - t0:.0f}s)")
+
+lodo_df = pd.DataFrame(lodo_rows).set_index("held_out_file")
+pd.set_option("display.width", 250)
+pd.set_option("display.max_columns", None)
+print("\nLEAVE-ONE-DAY-OUT")
+print(lodo_df.round(4))
+lodo_df.round(4).to_csv(OUT_DIR / "robustness_leave_one_day_out.csv")
+
+# %% Plot: leave-one-day-out
+short = [
+    s.replace(".pcap_ISCX.csv", "").replace("-WorkingHours", "")
+    for s in lodo_df.index
+]
+pos = np.arange(len(short))
+fig, ax = plt.subplots(figsize=(11, 6))
+ax.bar(pos - 0.2, lodo_df["attack_detection"].fillna(0), width=0.4,
+       label="attack detection rate (higher is better)")
+ax.bar(pos + 0.2, lodo_df["false_alarm_rate"].fillna(0), width=0.4,
+       label="false alarm rate on benign (lower is better)")
+ax.set_xticks(pos)
+ax.set_xticklabels(short, rotation=30, ha="right", fontsize=8)
+ax.set_ylim(0, 1.05)
+ax.set_title("Leave-one-day-out: attacks the model has never seen")
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "robustness_leave_one_day_out.png", dpi=150)
+plt.close()
+print("Saved tables and plots to", OUT_DIR)

@@ -1,0 +1,183 @@
+# %% [markdown]
+# # Imbalance strategies on CIC-IDS2017
+# Same split and model (Random Forest) for every strategy, so differences come
+# only from how the TRAINING data is handled. The test set is never resampled.
+# Requires: pip install imbalanced-learn
+ 
+# %% Imports and settings
+import time
+from pathlib import Path
+ 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    f1_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import label_binarize
+ 
+OUT_DIR = Path("outputs")
+RANDOM_STATE = 42
+TEST_SIZE = 0.30
+MAX_TRAIN_PER_CLASS = 50_000   # same cap as script 02, so results are comparable
+UNDER_CAP = 5_000              # undersampling: no class larger than this
+SMOTE_TARGET = 5_000           # SMOTE: classes smaller than this are grown to this
+ 
+# %% Load data and split (identical to script 02)
+df = pd.read_parquet(OUT_DIR / "cicids2017_clean.parquet")
+meta_cols = ["Label", "source_file", "is_attack"]
+features = [c for c in df.columns if c not in meta_cols]
+features = [c for c in features if df[c].nunique() > 1]
+ 
+X = df[features].astype("float32")
+y = df["Label"]
+ 
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
+)
+ 
+rng = np.random.RandomState(RANDOM_STATE)
+keep = []
+for cls, grp in y_train.groupby(y_train):
+    ids = grp.index.values
+    if len(ids) > MAX_TRAIN_PER_CLASS:
+        ids = rng.choice(ids, MAX_TRAIN_PER_CLASS, replace=False)
+    keep.append(ids)
+keep = np.concatenate(keep)
+X_train, y_train = X_train.loc[keep], y_train.loc[keep]
+ 
+print("Train:", X_train.shape, "Test:", X_test.shape)
+print(y_train.value_counts())
+ 
+# %% Strategy definitions
+# Each returns (X_resampled, y_resampled, class_weight)
+def strategy_none(X, y):
+    return X, y, None
+ 
+ 
+def strategy_class_weight(X, y):
+    return X, y, "balanced"
+ 
+ 
+def strategy_undersample(X, y):
+    counts = y.value_counts()
+    target = {c: min(n, UNDER_CAP) for c, n in counts.items()}
+    Xr, yr = RandomUnderSampler(
+        sampling_strategy=target, random_state=RANDOM_STATE
+    ).fit_resample(X, y)
+    return Xr, yr, None
+ 
+ 
+def _smote(X, y, target):
+    counts = y.value_counts()
+    grow = {c: target for c, n in counts.items() if n < target}
+    k = max(1, min(5, int(counts.min()) - 1))
+    return SMOTE(
+        sampling_strategy=grow, k_neighbors=k, random_state=RANDOM_STATE
+    ).fit_resample(X, y)
+ 
+ 
+def strategy_smote(X, y):
+    Xr, yr = _smote(X, y, SMOTE_TARGET)
+    return Xr, yr, None
+ 
+ 
+def strategy_hybrid(X, y):
+    # undersample the big classes first, then SMOTE the small ones
+    counts = y.value_counts()
+    target = {c: min(n, UNDER_CAP) for c, n in counts.items()}
+    Xu, yu = RandomUnderSampler(
+        sampling_strategy=target, random_state=RANDOM_STATE
+    ).fit_resample(X, y)
+    Xr, yr = _smote(Xu, yu, SMOTE_TARGET)
+    return Xr, yr, None
+ 
+ 
+strategies = {
+    "1_none": strategy_none,
+    "2_class_weight": strategy_class_weight,
+    "3_undersample": strategy_undersample,
+    "4_smote": strategy_smote,
+    "5_hybrid": strategy_hybrid,
+}
+ 
+# %% Helper: macro PR-AUC
+def macro_pr_auc(y_true, proba, classes):
+    y_bin = label_binarize(y_true, classes=classes)
+    scores = [
+        average_precision_score(y_bin[:, i], proba[:, i])
+        for i in range(len(classes))
+        if y_bin[:, i].sum() > 0
+    ]
+    return float(np.mean(scores))
+ 
+ 
+# %% Run every strategy
+results = []
+per_class_f1 = {}
+per_class_recall = {}
+ 
+for name, fn in strategies.items():
+    print(f"\n{'=' * 70}\n{name}\n{'=' * 70}")
+    t0 = time.time()
+    Xr, yr, cw = fn(X_train, y_train)
+    print("Resampled training size:", len(Xr))
+    print(pd.Series(yr).value_counts().to_dict())
+ 
+    model = RandomForestClassifier(
+        n_estimators=100, n_jobs=-1, class_weight=cw, random_state=RANDOM_STATE
+    )
+    model.fit(Xr, yr)
+    elapsed = time.time() - t0
+ 
+    pred = model.predict(X_test)
+    proba = model.predict_proba(X_test)
+    rep = classification_report(y_test, pred, output_dict=True, zero_division=0)
+ 
+    results.append({
+        "strategy": name,
+        "train_rows": len(Xr),
+        "macro_f1": f1_score(y_test, pred, average="macro", zero_division=0),
+        "weighted_f1": f1_score(y_test, pred, average="weighted", zero_division=0),
+        "macro_pr_auc": macro_pr_auc(y_test, proba, model.classes_),
+        "seconds": round(elapsed, 1),
+    })
+    per_class_f1[name] = {c: rep[c]["f1-score"] for c in model.classes_}
+    per_class_recall[name] = {c: rep[c]["recall"] for c in model.classes_}
+    print(results[-1])
+ 
+# %% Summary tables
+summary = pd.DataFrame(results).set_index("strategy").round(4)
+f1_table = pd.DataFrame(per_class_f1).round(3)
+recall_table = pd.DataFrame(per_class_recall).round(3)
+ 
+print("\nSUMMARY\n", summary)
+print("\nPER-CLASS F1\n", f1_table)
+print("\nPER-CLASS RECALL\n", recall_table)
+ 
+summary.to_csv(OUT_DIR / "imbalance_summary.csv")
+f1_table.to_csv(OUT_DIR / "imbalance_per_class_f1.csv")
+recall_table.to_csv(OUT_DIR / "imbalance_per_class_recall.csv")
+ 
+# %% Plot: F1 of the hardest classes across strategies
+hard = ["Bot", "Web Attack - Brute Force", "Web Attack - XSS",
+        "Infiltration", "Web Attack - Sql Injection", "Heartbleed"]
+hard = [c for c in hard if c in f1_table.index]
+ 
+ax = f1_table.loc[hard].plot(kind="bar", figsize=(12, 6), width=0.85)
+ax.set_ylabel("F1 score")
+ax.set_ylim(0, 1.05)
+ax.set_title("F1 on the rarest classes by imbalance strategy (Random Forest)")
+plt.xticks(rotation=30, ha="right")
+plt.legend(title="strategy", fontsize=8)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "imbalance_rare_class_f1.png", dpi=150)
+plt.close()
+print("Saved tables and plot to", OUT_DIR)
+ 
